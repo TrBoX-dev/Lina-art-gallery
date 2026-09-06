@@ -1132,18 +1132,34 @@ function refreshLightboxContent(art){
   document.getElementById('lbDesc').textContent = desc;
   document.getElementById('lbDesc').className = currentLang==='ar' ? 'font-body-ar text-[13.5px] leading-relaxed text-[var(--charcoal)]/70 mb-7' : 'text-[13.5px] leading-relaxed text-[var(--charcoal)]/70 mb-7';
   document.getElementById('lbWhatsapp').href = buildLightboxWhatsappLink(art);
+  // Keep the browser tab title in sync with whatever artwork + language is
+  // currently shown in the modal (covers both the initial open AND any
+  // later language switch performed while the modal stays open).
+  document.title = `${title} — ${SITE_NAME}`;
 }
 
 /* Explicit user-initiated (or user-triggered) open: fills content AND makes
    the modal visible. Only ever called from an actual "open" interaction
    (clicking a painting card) — never from the language switcher. */
-function openLightbox(art){
+function openLightbox(art, options = {}){
+  // updateHistory === true  -> this is a genuine user-initiated open (a card
+  //                            was clicked), so we push a brand-new history
+  //                            entry and change the URL / tab title.
+  // updateHistory === false -> we are OPENING the modal to reflect history
+  //                            state that already exists (initial deep-link
+  //                            page load from a QR code, or the user pressing
+  //                            the Forward button) — the URL is already
+  //                            correct, so we must NOT push a duplicate entry.
+  const { updateHistory = true } = options;
+
   currentLightboxArt = art;
-  refreshLightboxContent(art);
+  refreshLightboxContent(art); // also syncs document.title for the artwork
 
   lightbox.classList.remove('hidden');
   lightbox.classList.add('flex');
   document.body.style.overflow = 'hidden';
+
+  if(updateHistory) pushArtworkURL(art);
 }
 function buildLightboxWhatsappLink(art){
   const title = art['title' + langKey(currentLang)];
@@ -1155,7 +1171,16 @@ function buildLightboxWhatsappLink(art){
   };
   return `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(messages[currentLang])}`;
 }
-function closeLightbox(){
+function closeLightbox(options = {}){
+  // updateHistory === true  -> genuine user-initiated close (X button,
+  //                            backdrop click, Escape key): push a fresh
+  //                            history entry back to the clean base URL.
+  // updateHistory === false -> we are CLOSING only because a popstate event
+  //                            (Back button) already navigated the browser
+  //                            there for us — pushing again would create a
+  //                            duplicate / broken history entry.
+  const { updateHistory = true } = options;
+
   lightbox.classList.add('hidden');
   lightbox.classList.remove('flex');
   document.body.style.overflow = '';
@@ -1164,10 +1189,172 @@ function closeLightbox(){
   // artwork reference left behind, there is nothing stale for setLanguage()
   // to act on.
   currentLightboxArt = null;
+  // Always restore the original tab title, regardless of how we got here.
+  document.title = DEFAULT_TITLE;
+
+  if(updateHistory) resetArtworkURL();
 }
 document.getElementById('lbClose').addEventListener('click', closeLightbox);
 document.getElementById('lbOverlay').addEventListener('click', closeLightbox);
 window.addEventListener('keydown', e=>{ if(e.key === 'Escape') closeLightbox(); });
+
+/* ============================================================
+   DEEP LINKING & BROWSER HISTORY MANAGEMENT
+   Gives every artwork a unique, shareable URL (?artwork=slug) so that a
+   printed QR code next to a physical painting can open that painting's
+   Lightbox directly, with full Back/Forward support and a clean fallback
+   for broken or unknown links.
+   ============================================================ */
+
+/* Human-readable gallery name used to build the per-artwork tab title,
+   e.g. "Élégance Africaine — Lina Troudi Art Gallery". */
+const SITE_NAME = "Lina Troudi Art Gallery";
+
+/* Captured once, before anything can ever mutate document.title, so the
+   original tab title can always be restored exactly when the Lightbox
+   closes. */
+const DEFAULT_TITLE = document.title;
+
+/* --------------------------------------------------------------
+   Slug helpers
+   -------------------------------------------------------------- */
+
+/* Converts arbitrary text (French, English, or otherwise accented text)
+   into a clean, lowercase, URL-safe slug:
+     "Élégance Africaine au Voile Rouge"  ->  "elegance-africaine-au-voile-rouge"
+     "L'Artisan de la Médina"           ->  "l-artisan-de-la-medina"               */
+function slugify(text){
+  return String(text)
+    .normalize('NFD')                 // split accented letters into base + diacritic marks
+    .replace(/[\u0300-\u036f]/g, '') // strip the diacritic marks (accents, cedillas, etc.)
+    .toLowerCase()
+    .trim()
+    .replace(/'/g, '-')               // apostrophes ("l'artisan") become separators
+    .replace(/[^a-z0-9\s-]/g, '')     // drop anything else that isn't alphanumeric/space/hyphen
+    .replace(/\s+/g, '-')            // collapse whitespace runs into single hyphens
+    .replace(/-+/g, '-')              // collapse repeated hyphens
+    .replace(/^-+|-+$/g, '');         // trim leading/trailing hyphens
+}
+
+/* Returns the canonical slug used in the shareable URL for a given artwork.
+   Every artwork in this gallery already ships with a clean, unique `id`
+   (e.g. "desert-camel-woman", "medina-marchand"), so that id IS the slug
+   whenever it's present. Only artworks that somehow lack an id fall back
+   to a slug generated from their French title (with English as a second
+   fallback), guaranteeing every artwork always resolves to *some* slug. */
+function getArtworkSlug(art){
+  if(art && art.id) return art.id;
+  const fallbackTitle = (art && (art.titleFr || art.titleEn || art.titleAr)) || '';
+  return slugify(fallbackTitle);
+}
+
+/* Resolves a slug taken from the URL back to an artwork object. Checks the
+   id/slug first, then falls back to matching a slugified title in any of
+   the three supported languages, so links keep working even if a slug was
+   generated from a title rather than an id. Returns null (never throws) if
+   nothing matches, so the caller can fall back to the gallery grid. */
+function findArtworkBySlug(slug){
+  if(!slug) return null;
+  const needle = String(slug).toLowerCase().trim();
+  if(!needle) return null;
+
+  const byId = artworks.find(a => getArtworkSlug(a).toLowerCase() === needle);
+  if(byId) return byId;
+
+  const byTitle = artworks.find(a =>
+    slugify(a.titleFr) === needle ||
+    slugify(a.titleEn) === needle ||
+    slugify(a.titleAr) === needle
+  );
+  return byTitle || null;
+}
+
+/* --------------------------------------------------------------
+   URL / history helpers
+   -------------------------------------------------------------- */
+
+/* Pushes a brand-new history entry for the given artwork without reloading
+   the page, e.g. /?artwork=medina-marchand. The artwork's slug is also
+   stored in the history state object so popstate (Back/Forward) can tell
+   which artwork — if any — a given history entry corresponds to. */
+function pushArtworkURL(art){
+  const slug = getArtworkSlug(art);
+  const url = `${window.location.pathname}?artwork=${encodeURIComponent(slug)}${window.location.hash || ''}`;
+  history.pushState({ artworkSlug: slug }, '', url);
+}
+
+/* Pushes a brand-new history entry back to the clean base URL (no query
+   string), used whenever the Lightbox is explicitly closed by the user. */
+function resetArtworkURL(){
+  history.pushState(null, '', window.location.pathname + (window.location.hash || ''));
+}
+
+/* --------------------------------------------------------------
+   Initial page load: open the Lightbox directly if the URL already
+   contains a valid ?artwork=slug (this is exactly what happens when a
+   visitor scans a QR code next to a physical painting).
+   -------------------------------------------------------------- */
+function initDeepLinkFromURL(){
+  const params = new URLSearchParams(window.location.search);
+  const slug = params.get('artwork');
+
+  if(!slug){
+    return; // nothing to deep-link to — plain gallery load, do nothing
+  }
+
+  const art = findArtworkBySlug(slug);
+
+  if(art){
+    const canonicalSlug = getArtworkSlug(art);
+    // Normalize the very first history entry to carry the artwork slug in
+    // its state (replaceState, NOT pushState, since we don't want an extra
+    // entry — the page has only loaded once). This lets a later Back press
+    // land cleanly outside the artwork view instead of on a "ghost" entry.
+    history.replaceState(
+      { artworkSlug: canonicalSlug },
+      '',
+      `${window.location.pathname}?artwork=${encodeURIComponent(canonicalSlug)}${window.location.hash || ''}`
+    );
+    openLightbox(art, { updateHistory: false });
+  } else {
+    // Malformed or unknown slug: fail gracefully. Never throw, never leave
+    // the visitor on a broken screen — just show the normal gallery grid
+    // and silently strip the invalid query parameter from the address bar.
+    history.replaceState(null, '', window.location.pathname + (window.location.hash || ''));
+  }
+}
+
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', initDeepLinkFromURL);
+} else {
+  // DOMContentLoaded may already have fired by the time this script runs
+  // (it lives at the very end of <body>) — in that case, run immediately.
+  initDeepLinkFromURL();
+}
+
+/* --------------------------------------------------------------
+   Browser Back / Forward support.
+   Each history entry created by this gallery carries either
+   { artworkSlug } (an artwork view) or null (the base gallery view) as its
+   state, so popstate just needs to read that state and make the Lightbox
+   match it — no URL re-parsing required.
+   -------------------------------------------------------------- */
+window.addEventListener('popstate', (event)=>{
+  const slug = event.state && event.state.artworkSlug;
+
+  if(slug){
+    const art = findArtworkBySlug(slug);
+    if(art){
+      openLightbox(art, { updateHistory: false });
+    } else {
+      // Extremely defensive fallback: a slug made it into history state but
+      // no longer matches any artwork. Close cleanly rather than error out.
+      closeLightbox({ updateHistory: false });
+    }
+  } else {
+    closeLightbox({ updateHistory: false });
+  }
+});
 
 /* ============================================================
    MISC
